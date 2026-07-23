@@ -56,6 +56,10 @@
   .chart-wrap{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;box-shadow:var(--shadow);height:420px;position:relative}
   .corr-note{font-size:13px;color:var(--muted);margin:8px 0 0}
   .corr-note b{color:var(--accent2)}
+  /* 排位变化图容器 */
+  .rank-wrap{height:auto;margin-top:12px;display:none}
+  .rank-wrap .rank-title{margin:0 0 8px;font-size:14px;color:var(--muted)}
+  .rank-canvas-box{height:360px;position:relative}
   .empty{color:var(--muted);text-align:center;padding:30px}
   .badge{display:inline-block;font-size:11px;padding:1px 6px;border-radius:3px;background:#eef1f4;margin-left:6px;color:var(--muted)}
   .small{font-size:12px;color:var(--muted)}
@@ -82,6 +86,7 @@
     .query-box input{min-width:0;flex:1 1 60%;font-size:13px;padding:8px 10px}
     .query-box button{padding:8px 14px;font-size:13px}
     .chart-wrap{height:300px;padding:10px}
+    .rank-canvas-box{height:260px}
     .result-card{padding:10px 12px}
     .result-card .name{font-size:15px}
     .result-card .stats{gap:10px 14px;font-size:12px}
@@ -122,6 +127,11 @@
     <div id="queryResult"></div>
     <div class="chart-wrap"><canvas id="chart"></canvas></div>
     <p class="corr-note" id="corrNote"></p>
+    <div class="chart-wrap rank-wrap" id="rankWrap">
+      <h2 class="rank-title">板块情绪分排位变化</h2>
+      <div class="rank-canvas-box"><canvas id="chartRank"></canvas></div>
+      <p class="corr-note" id="rankNote"></p>
+    </div>
   </section>
 
   <section id="tab-all" class="tab-content">
@@ -136,6 +146,38 @@
 <script>
 const D = window.SENTIMENT_DATA || {meta:{},sectors:{},indices:{},latest:null};
 let chartObj = null;
+let rankChartObj = null;
+let dayIndexCache = null;
+
+// ---------- 构建日期索引：date -> [{code,score}] 按score降序 ----------
+function buildDayIndex(){
+  if(dayIndexCache) return dayIndexCache;
+  const idx = {};
+  for(const c in D.sectors){
+    const s = D.sectors[c];
+    for(const x of (s.series||[])){
+      if(x.score==null || x.score===undefined || isNaN(x.score)) continue;
+      if(!idx[x.date]) idx[x.date]=[];
+      idx[x.date].push({code:c, score:x.score});
+    }
+  }
+  for(const d in idx){ idx[d].sort((a,b)=>b.score-a.score); }
+  dayIndexCache = idx;
+  return idx;
+}
+// ---------- 查某板块每日排位序列 ----------
+function calcRankSeries(code){
+  const idx = buildDayIndex();
+  const dates = Object.keys(idx).sort();
+  const ranks = []; const totals = []; const scores = [];
+  for(const d of dates){
+    const arr = idx[d];
+    const pos = arr.findIndex(x=>x.code===code);
+    if(pos>=0){ ranks.push(pos+1); totals.push(arr.length); scores.push(arr[pos].score); }
+    else { ranks.push(null); totals.push(arr.length); scores.push(null); }
+  }
+  return {dates, ranks, totals, scores, totalSectors:Object.keys(D.sectors).length};
+}
 
 // ---------- 工具函数 ----------
 function fmtPct(v){ if(v===null||v===undefined||isNaN(v)) return '-'; return (v>=0?'+':'')+v.toFixed(2)+'%'; }
@@ -275,9 +317,16 @@ function doQuery(){
 
 function drawSectorChart(code){
   const s=D.sectors[code]; if(!s){ return; }
+  const rankWrap=document.getElementById('rankWrap');
   const series=s.series||[];
   const res=document.getElementById('queryResult');
-  if(!series.length){ res.innerHTML=`<div class="result-card"><div class="name">${esc(s.name)}</div><div class="empty">暂无历史数据（首次采集后次日可见趋势）</div></div>`; document.getElementById('corrNote').textContent=''; return; }
+  if(!series.length){
+    res.innerHTML=`<div class="result-card"><div class="name">${esc(s.name)}</div><div class="empty">暂无历史数据（首次采集后次日可见趋势）</div></div>`;
+    document.getElementById('corrNote').textContent='';
+    if(rankChartObj){ rankChartObj.destroy(); rankChartObj=null; }
+    rankWrap.style.display='none';
+    return;
+  }
   const latest=series[series.length-1];
   // 计算与各指数的相关度
   const dates = series.map(x=>x.date);
@@ -348,6 +397,74 @@ function drawSectorChart(code){
         x:{ticks:{maxRotation:45,font:{size:10}},grid:{display:false}},
         y:{type:'linear',position:'left',min:-100,max:100,title:{display:true,text:'情绪分 (-100~100)'}},
         y1:{type:'linear',position:'right',grid:{drawOnChartArea:false},title:{display:true,text:'指数涨跌幅 %'}}
+      }
+    }
+  });
+  // 画排位变化图
+  drawRankChart(code, s.name);
+}
+
+// ---------- 画排位变化图 ----------
+function drawRankChart(code, name){
+  const wrap=document.getElementById('rankWrap');
+  if(rankChartObj){ rankChartObj.destroy(); rankChartObj=null; }
+  const rs=calcRankSeries(code);
+  if(!rs.dates.length || rs.ranks.every(x=>x===null)){
+    wrap.style.display='none';
+    document.getElementById('rankNote').textContent='';
+    return;
+  }
+  wrap.style.display='block';
+  // 排位注释：最新排位 + 区间最佳/最差
+  const validIdx=[]; rs.ranks.forEach((r,i)=>{ if(r!=null) validIdx.push(i); });
+  let noteTxt='';
+  if(validIdx.length){
+    const lastI=validIdx[validIdx.length-1];
+    const lastRank=rs.ranks[lastI]; const lastTotal=rs.totals[lastI];
+    const best=Math.min(...validIdx.map(i=>rs.ranks[i]));
+    const worst=Math.max(...validIdx.map(i=>rs.ranks[i]));
+    const firstRank=rs.ranks[validIdx[0]];
+    const totalSec=rs.totalSectors||lastTotal;
+    let trend='';
+    if(lastRank<firstRank) trend=`较区间起点上升 ${firstRank-lastRank} 名`;
+    else if(lastRank>firstRank) trend=`较区间起点下降 ${lastRank-firstRank} 名`;
+    else trend='与起点持平';
+    noteTxt=`共 ${totalSec} 个板块。最新排位 <b>${lastRank}/${lastTotal}</b>，区间最佳 <b>${best}</b>、最差 <b>${worst}</b>，${trend}。`;
+  }
+  document.getElementById('rankNote').innerHTML = `Y 轴为该板块在全部概念板块中的情绪分排位（1=最强）。${noteTxt}`;
+
+  const ctx=document.getElementById('chartRank').getContext('2d');
+  rankChartObj=new Chart(ctx,{
+    type:'line',
+    data:{ labels:rs.dates, datasets:[{
+      label:'情绪分排位', data:rs.ranks,
+      borderColor:'#7c3aed', backgroundColor:'rgba(124,58,237,.10)',
+      fill:true, tension:.25, pointRadius:2.5, borderWidth:2,
+      spanGaps:true,
+    }]},
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      interaction:{mode:'index',intersect:false},
+      plugins:{
+        legend:{display:false},
+        tooltip:{
+          callbacks:{
+            title:(items)=>items[0].label,
+            label:(c)=>{
+              const v=c.raw; if(v===null) return '排位: 无数据';
+              const i=c.dataIndex; const t=rs.totals[i]||'-';
+              const sc=rs.scores[i];
+              return `排位 ${v}/${t}，情绪分 ${sc!=null?sc:'-'}`;
+            }
+          }
+        }
+      },
+      scales:{
+        x:{ticks:{maxRotation:45,font:{size:10}},grid:{display:false}},
+        y:{type:'linear',position:'left',reverse:true,
+            title:{display:true,text:'排位（1=最强）'},
+            ticks:{stepSize:1,callback:(v)=> v%1===0? '第'+v+'名':''
+        }}
       }
     }
   });
